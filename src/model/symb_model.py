@@ -45,7 +45,7 @@ class TCNBlock(nn.Module):
 
 
 class TCNModel(nn.Module):
-    """Temporal Convolutional Network for your multi-step spaced forecasting"""
+    """Temporal Convolutional Network"""
     def __init__(self, n_steps, no_features, dropout_rate=0.3, hidden=100, num_layers=5, kernel_size=3, dilation_base=2):
         super().__init__()
         self.n_steps = n_steps
