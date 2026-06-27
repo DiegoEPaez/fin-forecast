@@ -22,6 +22,12 @@ Two types of neural networks are available to predict an LSTM, and a TCN (tempor
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
+## 🛠️ Tech Stack & Tooling
+
+* **Core Machine Learning:** Scikit-Learn, LightGBM / XGBoost.
+* **Data Processing & Analytics:** Pandas (Vectorized multi-index pipelines), NumPy, Statsmodels.
+* **Visualization:** Matplotlib, Seaborn (Custom financial plotting layouts).
+
 <!-- GETTING STARTED -->
 ## Getting Started
 Clone the repository build the docker container and run it. The output is written either to local system or to AWS S3 buckets.
