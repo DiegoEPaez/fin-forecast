@@ -5,7 +5,7 @@ import pandas as pd
 import requests
 
 # BANXICO: https://www.banxico.org.mx/SieAPIRest/service/v1/doc/catalogoSeries
-BMX_TOKEN = "dfca7fbff036551b711cc510e01882e5d331d6e59f067f6d1b5dbde613ad05de"
+BMX_TOKEN = "baaeab1b011e38e513f7b233e018828422d9ac973321b55ac122fb122737bcfb"
 
 
 def query_bmx(series, start_date, end_date):

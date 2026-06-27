@@ -15,6 +15,15 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import torch
 
+# configure logging once for the module
+LOG_FILE = "log/seriespred.log"
+logging.basicConfig(
+    filename=LOG_FILE,
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+logger = logging.getLogger(__name__)
+
 from data.handle_data import get_data
 from model.symb_model import SymbolModel
 
@@ -38,17 +47,35 @@ def create_lags(values, n_steps, pred_interval):
     :return: np.array, size [values.shape[0] - n_steps * pred_interval, n_steps + 1]
     """
     no_ex = values.shape[0] - n_steps * pred_interval
+    # note: the bare minimum length for *one* example is just
+    #   len(values) > n_steps * pred_interval
+    # (i.e. the input window must fit once).  The inequality tested below is
+    #   no_ex <= n_steps * pred_interval
+    # which algebraically is equivalent to
+    #   len(values) <= 2 * n_steps * pred_interval.
+    # That is a **stricter** requirement than the minimum for a single example;
+    # it guarantees the number of available examples (no_ex) exceeds the window
+    # length itself.  The reason we use the stronger check is practical: if you
+    # only have one or two examples, the model has virtually nothing to train on
+    # so we automatically reduce n_steps instead of trying to fit a nearly empty
+    # dataset.
     if no_ex <= n_steps * pred_interval:
-        logging.warning(
-            "Cannot create examples with given time series, there are: %s "
-            "values, and number of steps is %s and prediction interval is %s",
+        required_strict = n_steps * pred_interval * 2
+        logger.warning(
+            "series length %s, n_steps %s, pred_interval %s -> produced %s examples; "
+            "minimum for a single example is %s points, but enforcing a stricter "
+            "threshold of >2*n_steps*pred_interval (%s) to ensure sufficient data",
             values.shape[0],
             n_steps,
             pred_interval,
+            max(no_ex,0),
+            n_steps * pred_interval + 1,
+            required_strict,
         )
+        # adjust n_steps to the maximum that will still produce data
         n_steps = (values.shape[0] // 2) // pred_interval
         no_ex = values.shape[0] - n_steps * pred_interval
-        logging.warning("Number of steps updated to %s", n_steps)
+        logger.warning("number of steps automatically reduced to %s", n_steps)
     start = 0
     end = no_ex
     lags = [values[start:end]]
@@ -73,7 +100,7 @@ def stationary(series, pred_interval):
     try:
         pval0 = adfuller(series)[1]
     except Exception as e:
-        print(f"Attempted to make stationary series {series.name}, but failed")
+        logger.warning(f"Attempted to make stationary series {series.name}, but failed")
         return series, None
 
     if np.isnan(pval0) or pval0 < 0.1:
@@ -90,11 +117,11 @@ def stationary(series, pred_interval):
         )
         pval2 = adfuller(new_series_log)[1]
     except Exception as e:
-        print(f"Attempted to make log stationary series {series.name}, but failed")
+        logger.warning(f"Attempted to make log stationary series {series.name}, but failed")
         return series, None
 
     if pval2 > 0.1:
-        print(
+        logger.warning(
             f"Unable to make stationary series, p value remains greater than 0.1 for {series.name}"
         )
         min_val = np.argmin(np.array([pval0, pval1, pval2]))
@@ -129,7 +156,7 @@ def create_data(df_symbol, symbol, n_steps, pred_interval, path):
                         df_symbol[col][pred_interval:].values
                         - df_symbol[col][:-pred_interval].values
                     )
-                elif col2stat[col] == "logdif":
+                elif col2stat[col] == "log_dif":
                     new_data[col] = np.log(
                         df_symbol[col][pred_interval:].values
                     ) - np.log(df_symbol[col][:-pred_interval].values)
@@ -183,18 +210,42 @@ def score(preds, scaler_y, adj_value, type):
     :param X_score:
     :param symb_model:
     :param scaler_y:
-    :param adj_value:
-    :param type:
-    :return:
+    :param adj_value: base value used for reversing stationarity
+    :param type: one of None, 'dif', 'log_dif'
+    :return: predictions in original units
     """
     ypredsc = scaler_y.inverse_transform(preds)
 
     if type == "dif":
+        # predictions were on a differenced series: add the last known value
         ypredsc = ypredsc + adj_value
     elif type == "log_dif":
-        ypredsc = np.exp(ypredsc + np.log(ypredsc))
+        # inverse of log difference
+        ypredsc = adj_value * np.exp(ypredsc)
 
     return ypredsc
+
+def unscale_errors(errors, scaler_y, adj_value, stat_type):
+    """
+    Convert errors computed in scaled/stationary space back to original units.
+
+    :param errors: 1-D array of y_true - y_pred in the scaled domain
+    :param scaler_y: fitted StandardScaler for the target
+    :param adj_value: last known (or appropriate) value for reversing stationarity
+    :param stat_type: None, 'dif', or 'log_dif' (from col2stat)
+    :return: array of errors in original units
+    """
+    # invert the scaler; scaler expects 2-D
+    errs = scaler_y.inverse_transform(errors.reshape(-1, 1)).flatten()
+    if stat_type == "dif":
+        # differencing doesn't change the magnitude of the error
+        return errs
+    elif stat_type == "log_dif":
+        # approximate original error by taking exponential (error is additive in log space)
+        # this is a reasonable metric for reporting RMSE.
+        return adj_value * (np.exp(errs) - 1)
+    else:
+        return errs
 
 
 def errors_dist(
@@ -212,24 +263,24 @@ def errors_dist(
     Creates a probability distribution from the data, using "pred interval" trading days.
 
     """
-    print("Calculating errors: ")
+    logger.info("Calculating errors: ")
     errors = []
 
     kf = KFold(n_splits=cv_splits)
     kf.get_n_splits(X, y)
 
     for i in range(cv_loops):
-        print("Loop " + str(i + 1) + " of " + str(cv_loops))
+        logger.info("Loop %s of %s", i + 1, cv_loops)
         j = 1
         for train_index, test_index in kf.split(X):
-            print(f"Split j {j}")
+            logger.info("Split j %s", j)
             X_train, X_test = (
-                torch.tensor(X[train_index]).float(),
-                torch.tensor(X[test_index]).float(),
+                torch.tensor(X[train_index]).float().to(symb_model.device),
+                torch.tensor(X[test_index]).float().to(symb_model.device),
             )
             y_train, y_test = (
-                torch.tensor(y[train_index]).float(),
-                torch.tensor(y[test_index]).float(),
+                torch.tensor(y[train_index]).float().to(symb_model.device),
+                torch.tensor(y[test_index]).float().to(symb_model.device),
             )
 
             symb_model.get_model(
@@ -240,8 +291,8 @@ def errors_dist(
                 train_all=train_all,
             )
 
-            y_pred = symb_model(X_test).detach().numpy()
-            error = y_test[:, -1, 0] - y_pred[:, -1, 0]
+            y_pred = symb_model(X_test).detach().cpu().numpy()
+            error = y_test[:, -1, 0].cpu().numpy() - y_pred[:, -1, 0]
             errors.extend(error.tolist())
             j += 1
 
@@ -261,13 +312,15 @@ def pred_dist(
     pred_interval,
 ):
     preds = np.zeros(no_pred * no_samples)
-    X, y = torch.tensor(X).float(), torch.tensor(y).float()
+    X = torch.tensor(X).float().to(symb_model.device)
+    y = torch.tensor(y).float().to(symb_model.device)
+    X_score = torch.tensor(X_score).float().to(symb_model.device)
     for i in range(no_pred):
-        print("Prediction " + str(i + 1) + " of " + str(no_pred))
+        logger.info("Prediction %s of %s", i + 1, no_pred)
         symb_model.get_model(
             n_epochs, X, y, path=f"trained/{symbol}/{pred_interval}/train"
         )
-        y_pred = symb_model(X_score).detach().numpy()
+        y_pred = symb_model(X_score).detach().cpu().numpy()
 
         pred = y_pred[0, -1, 0]
         preds[i * no_samples : (i + 1) * no_samples] = pred + np.random.choice(
@@ -288,7 +341,7 @@ def predict(params, df_symbol, path):
     X_train, y_train, X_test, y_test = [torch.tensor(x).float() for x in splitted]
     X_score = torch.tensor(Xs).float()
 
-    symb_model = SymbolModel(*X_train.shape[1:])
+    symb_model = SymbolModel(*X_train.shape[1:], architecture="tcn")
 
     n_epochs = params["n_epochs"]
     cv_loops = params["cv_loops"]
@@ -299,7 +352,17 @@ def predict(params, df_symbol, path):
     errors = errors_dist(
         X, y, symb_model, cv_loops, cv_splits, n_epochs, symb, interval
     )
-    print(f"RMSE of cross val: {np.sqrt((errors ** 2.0).mean())}")
+
+    # scaled-domain RMSE (for diagnostics)
+    rmse_scaled = np.sqrt((errors ** 2.0).mean())
+
+    # translate errors back to original units so we can report a human‑readable RMSE
+    last_known = df_symbol[symb].iloc[-1]          # always correct for future predictions
+    errs_unscaled = unscale_errors(errors, scaler_y, last_known, col2stat[symb])
+    rmse_unscaled = np.sqrt((errs_unscaled ** 2.0).mean())
+
+    logger.info(f"RMSE cross val (scaled space): {rmse_scaled:.4f}")
+    logger.info(f"RMSE cross val (original units): {rmse_unscaled:.4f}")
 
     preds = pred_dist(
         X,
@@ -314,8 +377,8 @@ def predict(params, df_symbol, path):
         interval,
     )
 
-    idx_score = n_steps * interval + r_cut
-    preds = score(preds, scaler_y, df_symbol[symb].iloc[idx_score], col2stat[symb])
+    last_known = df_symbol[symb].iloc[-1]          # always correct for future predictions
+    preds = score(preds, scaler_y, last_known, col2stat[symb])
 
     return preds
 
@@ -408,7 +471,7 @@ def main():
             "no_samples": 1000,
         }
 
-        print(f"Predicting for interval {i} of {symbol}")
+        logger.info(f"Predicting for interval {i} of {symbol}")
         path = f"trained/{symbol}/{i}"
 
         # I patched the code to work with tech indicators only if interval is 45 or less;
@@ -421,7 +484,7 @@ def main():
                 df_notech = df_symbol.drop(tech_vars, axis=1)
                 preds = predict(parameters, df_notech, path).flatten()
             except ValueError as e:
-                print(e)
+                logger.exception(e)
                 preds = predict(parameters, df_symbol, path).flatten()
         else:
             preds = predict(parameters, df_symbol, path).flatten()
@@ -437,10 +500,13 @@ def main():
     plot_predictions(df_symbol, symbol, predictions, intervals)
 
     # TOOD
-    # Try conv1D + RNN arch
-    # Try self attention decoder
+    # Quantify error of TCN vs LSTM
+    # Check book Time Series forecasting using Deep Learnng
+    # Mix approach of coarse predictions (e.g. 30 day windows) vs using full data. Note that
+    #   TCN already uses dilations. 
     # Try adding other series EURUSD, ...
-    # Move this to AWS Batch / create docker container
+    # Add pyproject.toml
+    # Add poetry
 
 
 if __name__ == "__main__":

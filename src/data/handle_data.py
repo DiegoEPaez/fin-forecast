@@ -2,6 +2,9 @@ import logging
 import math
 from datetime import timedelta, datetime
 
+# module-specific logger
+logger = logging.getLogger(__name__)
+
 import yfinance as yf
 from sklearn.preprocessing import MinMaxScaler
 
@@ -164,12 +167,12 @@ def build_usdmxn(info_dict):
     join = join_series(dfs)
     join = join.interpolate("linear")
     join = join[join.index >= min_date]
-    print("Series starts at:", join.index[0])
+    logger.info("Series starts at: %s", join.index[0])
     min_date = join.index[0]
 
     vars_required = ["INPC", "CPIAUCNS", "USDMXN", "CETES28", "FEDFUNDS"]
     if len(vars_required) > len(set(vars_required) & set(join.columns)):
-        logging.info(
+        logger.info(
             "Unable to calculate difference of rates and inflation due to missing columns"
         )
         return join
@@ -245,19 +248,53 @@ def move_by_freq(df, freq):
 
 
 def get_data_yahoo(name, start, end, yahoo_ticker, yahoo_col="Adj Close"):
-    logging.info("Downloading data from YAHOO for " + str(name))
-    df = yf.download(yahoo_ticker, start, end)
+    logger.info(f"Downloading data from YAHOO for {name} (ticker: {yahoo_ticker}, col: {yahoo_col})")
+    df = yf.download(yahoo_ticker, start, end, progress=False)
+
+    if df.empty:
+        logger.warning(f"No data returned for {yahoo_ticker}")
+        return pd.DataFrame()
 
     df.index = df.index.tz_localize(None)
-    df.index.names = ["DATE"]
+    df.index.name = "DATE"
 
-    df = df.filter([yahoo_col])
-    df = df.rename(columns={yahoo_col: name})
+    # Handle MultiIndex columns (common in recent yfinance)
+    if isinstance(df.columns, pd.MultiIndex):
+        # Flatten to single level (e.g. 'Adj Close' or 'Low')
+        df.columns = [col[0] if isinstance(col, tuple) else col for col in df.columns]
+        # Or more robust: join levels if needed
+        # df.columns = ['_'.join(str(c) for c in col if c).strip() for col in df.columns.values]
+
+    # Now select the column safely
+    possible_cols = [yahoo_col, yahoo_col.lower(), yahoo_col.upper()]
+    selected_col = None
+    for c in possible_cols:
+        if c in df.columns:
+            selected_col = c
+            break
+
+    if selected_col is None:
+        # Fallback: take first available numeric column
+        numeric_cols = df.select_dtypes(include='number').columns
+        if len(numeric_cols) > 0:
+            selected_col = numeric_cols[0]
+            logger.warning(f"Requested col '{yahoo_col}' not found for {yahoo_ticker}. Using '{selected_col}' instead.")
+        else:
+            logger.error(f"No numeric columns found for {yahoo_ticker}")
+            return pd.DataFrame()
+
+    df = df[[selected_col]].copy()
+    df = df.rename(columns={selected_col: name})
+
+    # Final safety: ensure single level
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [name]  # force it
+
     return df
 
-
+    
 def get_data_fred(name, start, end, freq):
-    logging.info("Downloading data from FRED for " + str(name))
+    logger.info("Downloading data from FRED for " + str(name))
 
     FRED_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv?"
     var_ws = (
@@ -269,9 +306,26 @@ def get_data_fred(name, start, end, freq):
         + "&id="
         + name
     )
-    df = pd.read_csv(var_ws, index_col="DATE", parse_dates=True, na_values=na_values)
+
+    # Read without header assumption, parse first column as date
+    df = pd.read_csv(
+        var_ws,
+        index_col=0,                # first column becomes index
+        parse_dates=True,
+        header=0,                   # assume first row is header (but we ignore name)
+        na_values=na_values,
+        dayfirst=False,
+        engine='python'             # fallback to python parser if C fails strangely
+    )
+
+    # Rename index to standard name (optional but clean)
+    df.index.name = "DATE"
 
     df = move_by_freq(df, freq)
+
+    # If the value column is still unnamed or wrong, rename it
+    if len(df.columns) == 1:
+        df.columns = [name]
 
     return df
 
@@ -298,7 +352,7 @@ def get_data_stockpup(name, filename, colname):
 
 
 def get_data_banxico(name, start, end, bmx_series, freq):
-    logging.info("Downloading data from BANXICO for " + str(name))
+    logger.info("Downloading data from BANXICO for " + str(name))
 
     df = dwld_bmx([bmx_series], start, end)[0]
 
@@ -310,7 +364,7 @@ def get_data_banxico(name, start, end, bmx_series, freq):
 
 
 def get_data_inegi(name, series):
-    logging.info("Downloading data from INEGI for " + str(name))
+    logger.info("Downloading data from INEGI for " + str(name))
 
     df = dwld_inegi(series)
     df = df.rename(columns={series: name})
@@ -319,7 +373,7 @@ def get_data_inegi(name, series):
 
 
 def get_data_multpl(name):
-    logging.info("Downloading data from MULTPL for " + str(name))
+    logger.info("Downloading data from MULTPL for " + str(name))
 
     df = dwld_multpl(name)
 
@@ -354,7 +408,7 @@ def create_ts(data, target, pred_interval, n_steps, ordered=False):
             data[col] = trans_func(data[col])
 
             if np.isnan(data[col]).any():
-                logging.warning(
+                logger.warning(
                     f'Nans detected in column {col} when applying transformation {info_dict[col]["transform"]}'
                 )
 
@@ -369,13 +423,13 @@ def create_ts(data, target, pred_interval, n_steps, ordered=False):
     # Create lags - CHECK N_STEPS
     no_ex = values.shape[0] - n_steps * pred_interval
     if no_ex < 0:
-        logging.warning(
+        logger.warning(
             f"Cannot create examples with given time series, there are: {values.shape[0]} values,and"
             f" number of steps is {n_steps} and prediction interval is {pred_interval}"
         )
         n_steps = math.floor(values.shape[0] / pred_interval)
         no_ex = values.shape[0] - n_steps * pred_interval
-        logging.warning(f"Number of steps updated to {n_steps}")
+        logger.warning(f"Number of steps updated to {n_steps}")
     start = 0
     end = no_ex
     lags = [values[start:end]]
