@@ -1,4 +1,5 @@
-<!-- ABOUT THE PROJECT -->
+# Financial Time-Series Prediction
+
 ## About The Project
 This repository contains a project which aims to predict financial time series over time spans longer than a month. The reason is that it relies mainly on macroeconomic variables such as interest rates, inflation, and others. The repository contains the references to download information to predict S&P500 and USDMXN. Nonetheless it can easily be changed to predict other time series.
 
